@@ -1,78 +1,130 @@
 """
 HackRx 6.0 – Insurance Assistant
-Plain-text, single-context mode
 """
 
-import os, textwrap, streamlit as st, google.generativeai as genai
+import os, json, textwrap, streamlit as st
+from concurrent.futures import ThreadPoolExecutor
+import google.generativeai as genai
 from dotenv import load_dotenv
 
-# ---------- Gemini ----------
+# ------------------ Gemini ------------------
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 MODEL = "gemini-1.5-flash"
-MAX_TOKENS = 1_000_000   # 1 M token context window
+MAX_CONTEXT = 25_000
 
-# ---------- helpers ----------
-def build_prompt(context: str, question: str) -> str:
-    return textwrap.dedent(f"""
+# ------------------ helpers ------------------
+def summarise(text: str) -> str:
+    prompt = f"Ultra-compact summary (120 words) of coverages & exclusions:\n{text[:MAX_CONTEXT]}"
+    return genai.GenerativeModel(MODEL).generate_content(prompt).text.strip()
+
+def answer_structured(question: str, summary: str) -> dict:
+    prompt = textwrap.dedent(f"""
         You are an expert insurance analyst.
-        Read the combined policy text below and answer the user’s question in **plain, conversational English**.
-        Do NOT include JSON, code, or links.
-
-        Policies:
-        {context[:MAX_TOKENS]}
+        Policy summary:
+        {summary}
 
         Question:
         {question}
 
-        Answer:
-    """).strip()
+        Reply **only** valid JSON:
+        {{
+          "decision": "Approved" | "Rejected",
+          "justification": "<short reason>",
+          "relevant_clauses": ["<excerpt>", "..."]
+        }}
+    """)
+    try:
+        raw = genai.GenerativeModel(MODEL).generate_content(prompt).text.strip()
+        raw = raw.removeprefix("```json").removesuffix("```").strip()
+        return json.loads(raw)
+    except Exception:
+        return {"decision": "Error", "justification": "Parse failure", "relevant_clauses": []}
 
-def merge_docs(files) -> str:
-    """Concatenate all uploaded files into one big string."""
-    full_text = ""
-    for file in files:
-        full_text += f"\n\n--- {file.name} ---\n"
-        full_text += file.read().decode("utf-8", errors="ignore")
-        file.seek(0)   # reset for next read
-    return full_text.strip()
+def summarise_all(files) -> str:
+    texts = [f.read().decode("utf-8", errors="ignore") for f in files]
+    for f in files:
+        f.seek(0)
+    with ThreadPoolExecutor() as pool:
+        summaries = list(pool.map(summarise, texts))
+    return "\n\n".join(summaries)
 
-# ---------- UI ----------
+# ------------------ UI ------------------
 st.set_page_config(page_title="Insurance AI", layout="centered")
-st.title("🏥 HackRx 6.0 – Insurance Assistant")
 
-uploaded = st.file_uploader(
-    "📄 Upload policy documents (.txt or .pdf)",
-    type=["txt", "pdf"],
-    accept_multiple_files=True
+# --- Hero / header ---
+st.markdown(
+    """
+    <style>
+    body {font-family: 'Segoe UI', sans-serif;}
+    .hero {text-align: center; margin-bottom: 2rem;}
+    .hero h1 {font-weight: 700; font-size: 2.2rem; color: #1E1E1E;}
+    .sub {color: #666; font-size: 1rem;}
+    .footer {text-align: center; font-size: 0.8rem; color: #999; margin-top: 4rem;}
+    .file-uploader {max-width: 600px; margin: auto;}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# chat memory
+st.markdown(
+    """
+    <div class="hero">
+        <h1>🏥 HackRx 6.0</h1>
+        <div class="sub">Minimal Insurance Policy Assistant</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --- File uploader (once) ---
+with st.container():
+    uploaded = st.file_uploader(
+        "",
+        type=["txt", "pdf"],
+        accept_multiple_files=True,
+        key="files",
+        help="Upload one or more policy documents, then start asking.",
+    )
+
+# --- Chat area ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# display history
+# display chat
 for role, msg in st.session_state.messages:
-    st.chat_message(role).write(msg)
+    with st.chat_message(role):
+        st.write(msg)
 
+# ---- bottom input ----
 if uploaded:
-    prompt = st.chat_input("Ask anything about the policies…")
+    # summarise once
+    if "summary" not in st.session_state:
+        with st.spinner("Reading & summarising policies…"):
+            st.session_state.summary = summarise_all(uploaded)
+
+    prompt = st.chat_input("Ask anything about the policies…", key="chat_input")
     if prompt:
         st.session_state.messages.append(("user", prompt))
         st.chat_message("user").write(prompt)
 
-        with st.spinner("Reading all documents…"):
-            context = merge_docs(uploaded)
-            try:
-                model = genai.GenerativeModel(MODEL)
-                answer = model.generate_content(build_prompt(context, prompt)).text.strip()
-            except Exception as e:
-                if "429" in str(e):
-                    answer = "🚦 You’ve hit the daily free-tier limit. Please try again tomorrow or upgrade your plan."
-                else:
-                    answer = f"⚠️ Error: {e}"
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                result = answer_structured(prompt, st.session_state.summary)
+            formatted = (
+                f"**Decision:** {result['decision']}\n\n"
+                f"**Justification:** {result['justification']}\n\n"
+                f"**Relevant Clauses:**\n"
+                + "\n".join(f"- {c}" for c in result["relevant_clauses"])
+            )
+            st.session_state.messages.append(("assistant", formatted))
+            st.write(formatted)
 
-        st.session_state.messages.append(("assistant", answer))
-        st.chat_message("assistant").write(answer)
 else:
-    st.info("Upload at least one policy file to start chatting.")
+    st.info("📂 Upload at least one policy file to begin.")
+
+# --- Footer ---
+st.markdown(
+    '<div class="footer">Powered by Google Gemini & Streamlit</div>',
+    unsafe_allow_html=True,
+)
